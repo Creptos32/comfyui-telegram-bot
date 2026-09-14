@@ -908,57 +908,135 @@ async def download_file(url, folder, progress_callback=None):
         except Exception as e:
             return 1, [f"{type(e).__name__}: {e}"]
 
-    # CivitAI
-    if "civitai.com/api/download/models/" in url:
+       # CivitAI
+    if "civitai.com" in url or "civitai.red" in url:
+        from urllib.parse import urlparse, parse_qs
+
+        parsed = urlparse(url)
+
+        # Уже прямая ссылка на скачивание — используем как есть
+        if "/api/download/models/" in parsed.path:
+            download_url = url
+        else:
+            # Ссылка на страницу модели: достаём modelVersionId
+            query = parse_qs(parsed.query)
+            version_id = query.get("modelVersionId", [None])[0]
+
+            if not version_id:
+                return 1, [
+                    "В ссылке нет modelVersionId. "
+                    "Откройте страницу модели на CivitAI, выберите нужную "
+                    "версию и скопируйте ссылку — в ней должен быть "
+                    "параметр ?modelVersionId=..."
+                ]
+
+            download_url = (
+                f"{parsed.scheme}://{parsed.netloc}"
+                f"/api/download/models/{version_id}"
+            )
+
         token = load_civitai_token()
 
         if not token:
             return 1, ["CivitAI Token не найден"]
 
-        try:
-            response = requests.get(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
-                stream=True,
-                timeout=60,
-                allow_redirects=True,
-            )
+        loop = asyncio.get_event_loop()
 
-            response.raise_for_status()
+        def sync_download():
+            import time as _time
 
+            output_path = None
             filename = None
-            content_disposition = response.headers.get("Content-Disposition", "")
-
-            if "filename=" in content_disposition:
-                filename = content_disposition.split("filename=", 1)[1].strip().strip('"')
-
-            if not filename:
-                filename = url.rstrip("/").split("/")[-1] or "model.safetensors"
-
-            output_path = target_dir / filename
-
-            total = int(response.headers.get("Content-Length", 0))
+            max_attempts = 8
+            attempt = 0
             downloaded = 0
+            total = 0
             last_percent = -1
 
-            with open(output_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
+            while attempt < max_attempts:
+                attempt += 1
 
-                        if total and progress_callback:
-                            percent = int(downloaded * 100 / total)
+                headers = {"Authorization": f"Bearer {token}"}
 
-                            if percent != last_percent:
-                                last_percent = percent
-                                await progress_callback(downloaded, total)
+                if output_path and output_path.exists():
+                    downloaded = output_path.stat().st_size
+                    headers["Range"] = f"bytes={downloaded}-"
 
-            return 0, [
-                f"СКАЧАНО: {output_path}",
-                f"Размер: {downloaded / 1024 / 1024:.1f} MB",
-            ]
+                response = requests.get(
+                    download_url,
+                    headers=headers,
+                    stream=True,
+                    timeout=(15, 120),
+                    allow_redirects=True,
+                )
 
+                if response.status_code not in (200, 206):
+                    response.raise_for_status()
+
+                if filename is None:
+                    content_disposition = response.headers.get("Content-Disposition", "")
+
+                    if "filename=" in content_disposition:
+                        filename = content_disposition.split("filename=", 1)[1].strip().strip('"')
+
+                    if not filename:
+                        filename = download_url.rstrip("/").split("/")[-1] or "model.safetensors"
+
+                    output_path = target_dir / filename
+
+                if total == 0:
+                    if response.status_code == 206:
+                        content_range = response.headers.get("Content-Range", "")
+                        if "/" in content_range:
+                            total = int(content_range.rsplit("/", 1)[-1])
+                    else:
+                        total = int(response.headers.get("Content-Length", 0))
+
+                mode = "ab" if response.status_code == 206 else "wb"
+
+                try:
+                    with open(output_path, mode) as f:
+                        for chunk in response.iter_content(chunk_size=1024 * 1024):
+                            if not chunk:
+                                continue
+
+                            f.write(chunk)
+                            downloaded += len(chunk)
+
+                            if total and progress_callback:
+                                percent = int(downloaded * 100 / total)
+
+                                if percent != last_percent:
+                                    last_percent = percent
+                                    try:
+                                        asyncio.run_coroutine_threadsafe(
+                                            progress_callback(downloaded, total),
+                                            loop,
+                                        )
+                                    except Exception:
+                                        pass
+
+                    return 0, [
+                        f"СКАЧАНО: {output_path}",
+                        f"Размер: {downloaded / 1024 / 1024:.1f} MB",
+                        f"Попыток: {attempt}",
+                    ]
+
+                except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as network_error:
+                    if attempt >= max_attempts:
+                        return 1, [
+                            f"Не удалось докачать после {max_attempts} попыток.",
+                            f"{type(network_error).__name__}: {network_error}",
+                            f"Скачано: {downloaded / 1024 / 1024:.1f} MB из {total / 1024 / 1024:.1f} MB",
+                        ]
+
+                    _time.sleep(3)
+                    continue
+
+            return 1, ["Скачивание не завершилось (исчерпаны попытки)."]
+
+        try:
+            return await asyncio.to_thread(sync_download)
         except Exception as e:
             return 1, [f"{type(e).__name__}: {e}"]
 
@@ -1330,12 +1408,25 @@ async def download_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Выбери 1, 2 или 0.")
 
 
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Есть ли активный сценарий /download или /manager?
+    active_menu = (
+        context.user_data.get("manager_menu")
+        or context.user_data.get("download_menu")
+    )
+
+    if active_menu:
+        await download_choice(update, context)
+        return
+
+    # Иначе это обычный промпт для генерации
+    await message(update, context)
+
+
 app.add_handler(CommandHandler("download", download_command))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_choice))
 app.add_handler(CommandHandler("manager", manager_command))
 app.add_handler(MessageHandler(filters.PHOTO, photo_message))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_type_choice))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
 if __name__ == "__main__":
     print("Bot started")
