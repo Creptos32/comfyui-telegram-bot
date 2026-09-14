@@ -1,3 +1,4 @@
+from huggingface_hub import hf_hub_download
 from pathlib import Path
 import os
 import json
@@ -396,6 +397,36 @@ def get_video_refs(context):
     return context.user_data.setdefault("video_refs", {})
 
 
+async def set_image_commands(bot, chat_id):
+    await bot.set_my_commands([
+        ("mode", "Выбрать режим"),
+        ("settings", "Настройки фото"),
+        ("size", "Размер изображения"),
+        ("steps", "Количество шагов"),
+        ("cfg", "CFG"),
+        ("seed", "Seed"),
+        ("samplers", "Список sampler"),
+        ("sampler", "Выбрать sampler"),
+        ("scheduler", "Выбрать scheduler"),
+    ], scope={"type": "chat", "chat_id": chat_id})
+
+
+async def set_video_commands(bot, chat_id):
+    await bot.set_my_commands([
+        ("mode", "Выбрать режим"),
+        ("video_settings", "Настройки видео"),
+        ("ratio", "Соотношение сторон"),
+        ("mp", "Разрешение видео"),
+        ("duration", "Длительность"),
+        ("vsteps", "Количество шагов"),
+        ("vseed", "Seed видео"),
+        ("ref1", "Первая референсная картинка"),
+        ("ref2", "Вторая референсная картинка"),
+        ("refs", "Показать референсы"),
+        ("clearrefs", "Очистить референсы"),
+    ], scope={"type": "chat", "chat_id": chat_id})
+
+
 async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1 or context.args[0].lower() not in ("image", "video"):
         await update.message.reply_text("Формат: /mode image или /mode video")
@@ -403,8 +434,13 @@ async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     mode = context.args[0].lower()
     context.user_data["mode"] = mode
-    await update.message.reply_text(f"Режим установлен: {mode}")
 
+    if mode == "video":
+        await set_video_commands(context.bot, update.effective_chat.id)
+    else:
+        await set_image_commands(context.bot, update.effective_chat.id)
+
+    await update.message.reply_text(f"Режим установлен: {mode}")
 
 async def ref1_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["awaiting_ref"] = "ref1"
@@ -639,7 +675,31 @@ async def message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as error:
             await update.message.reply_text(f"Ошибка:\n{error}")
 
-app = Application.builder().token(TOKEN).build()
+async def post_init(application):
+    await application.bot.set_my_commands([
+        ("start", "Запустить бота"),
+        ("mode", "Выбрать фото или видео"),
+        ("settings", "Настройки фото"),
+        ("size", "Размер изображения"),
+        ("steps", "Количество шагов"),
+        ("cfg", "CFG"),
+        ("seed", "Seed"),
+        ("samplers", "Список sampler"),
+        ("sampler", "Выбрать sampler"),
+        ("scheduler", "Выбрать scheduler"),
+        ("video_settings", "Настройки видео"),
+        ("ratio", "Соотношение сторон видео"),
+        ("mp", "Разрешение видео"),
+        ("duration", "Длительность видео"),
+        ("vsteps", "Шаги видео"),
+        ("vseed", "Seed видео"),
+        ("ref1", "Первая референсная картинка"),
+        ("ref2", "Вторая референсная картинка"),
+        ("refs", "Показать референсы"),
+        ("clearrefs", "Очистить референсы"),
+    ])
+
+app = Application.builder().token(TOKEN).post_init(post_init).build()
 
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("settings", settings_command))
@@ -661,8 +721,415 @@ app.add_handler(CommandHandler("mp", megapixels_command))
 app.add_handler(CommandHandler("duration", duration_command))
 app.add_handler(CommandHandler("vsteps", video_steps_command))
 app.add_handler(CommandHandler("vseed", video_seed_command))
+HF_TOKEN_FILE = Path("/workspace/telegram_bot/.hf_token")
+
+
+def save_hf_token(token):
+    HF_TOKEN_FILE.write_text(token.strip())
+    HF_TOKEN_FILE.chmod(0o600)
+
+
+def load_hf_token():
+    if HF_TOKEN_FILE.exists():
+        return HF_TOKEN_FILE.read_text().strip()
+    return None
+
+
+CIVITAI_TOKEN_FILE = Path("/workspace/telegram_bot/.civitai_token")
+
+
+def save_civitai_token(token):
+    CIVITAI_TOKEN_FILE.write_text(token.strip())
+    CIVITAI_TOKEN_FILE.chmod(0o600)
+
+
+def load_civitai_token():
+    if CIVITAI_TOKEN_FILE.exists():
+        return CIVITAI_TOKEN_FILE.read_text().strip()
+    return None
+
+
+async def download_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["download_menu"] = "source"
+
+    await update.message.reply_text(
+        "DOWNLOAD\n\n"
+        "1. Hugging Face\n"
+        "2. CivitAI\n"
+        "0. Отмена"
+    )
+
+
+MODEL_TYPES = {
+    "1": ("Checkpoints", "models/checkpoints"),
+    "2": ("LoRAs", "models/loras"),
+    "3": ("Text Encoders", "models/text_encoders"),
+    "4": ("VAE", "models/vae"),
+    "5": ("Diffusion Models", "models/diffusion_models"),
+    "6": ("Upscalers", "models/upscale_models"),
+    "7": ("CLIP", "models/clip"),
+    "8": ("Other", "models"),
+}
+
+
+async def download_type_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("download_menu") != "type":
+        return
+
+    choice = update.message.text.strip()
+
+    if choice == "0":
+        context.user_data["download_menu"] = "source"
+        await update.message.reply_text(
+            "DOWNLOAD\n\n"
+            "1. Hugging Face\n"
+            "2. CivitAI\n"
+            "0. Отмена"
+        )
+        return
+
+    if choice not in MODEL_TYPES:
+        await update.message.reply_text("Выбери номер от 1 до 8 или 0.")
+        return
+
+    name, folder = MODEL_TYPES[choice]
+
+    context.user_data["download_type"] = name
+    context.user_data["download_folder"] = folder
+    context.user_data["download_menu"] = "url"
+
+    await update.message.reply_text(
+        f"Тип: {name}\n"
+        f"Папка: {folder}\n\n"
+        "Отправь URL модели."
+    )
+
+
+async def download_url_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("download_menu") != "url":
+        return
+
+    url = update.message.text.strip()
+
+    if not (url.startswith("https://") or url.startswith("http://")):
+        await update.message.reply_text("Нужен корректный URL, начинающийся с http:// или https://")
+        return
+
+    folder = context.user_data.get("download_folder", "models")
+    source = context.user_data.get("download_source", "unknown")
+
+    context.user_data["download_url"] = url
+    context.user_data["download_menu"] = None
+
+    progress_message = await update.message.reply_text(
+        f"Источник: {source}\n"
+        f"Папка: /workspace/ComfyUI/{folder}\n\n"
+        "Начинаю скачивание..."
+    )
+
+    last_update = {"percent": -1}
+
+    async def progress_callback(downloaded, total):
+        percent = int(downloaded * 100 / total)
+
+        if percent == last_update["percent"]:
+            return
+
+        if percent % 5 != 0 and percent != 100:
+            return
+
+        last_update["percent"] = percent
+
+        downloaded_gb = downloaded / 1024 / 1024 / 1024
+        total_gb = total / 1024 / 1024 / 1024
+
+        try:
+            await progress_message.edit_text(
+                f"Источник: {source}\n"
+                f"Папка: /workspace/ComfyUI/{folder}\n\n"
+                f"Скачивание: {downloaded_gb:.2f} / {total_gb:.2f} GB "
+                f"({percent}%)"
+            )
+        except Exception:
+            pass
+
+    return_code, output = await download_file(
+        url,
+        folder,
+        progress_callback=progress_callback,
+    )
+
+    if return_code == 0:
+        await update.message.reply_text(
+            "Скачивание завершено."
+        )
+    else:
+        last_lines = "\n".join(output[-5:])
+        await update.message.reply_text(
+            "Ошибка скачивания.\n\n"
+            f"{last_lines}"
+        )
+
+
+async def download_file(url, folder, progress_callback=None):
+    target_dir = Path("/workspace/ComfyUI") / folder
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # Hugging Face
+    if "huggingface.co/" in url:
+        parts = url.split("huggingface.co/", 1)[1].split("/")
+
+        if len(parts) < 4:
+            return 1, ["Некорректный Hugging Face URL"]
+
+        repo_id = "/".join(parts[:2])
+
+        try:
+            marker = parts.index("resolve")
+            filename = "/".join(parts[marker + 2:])
+        except (ValueError, IndexError):
+            return 1, ["Не удалось определить имя файла из Hugging Face URL"]
+
+        hf_token = load_hf_token()
+
+        if not hf_token:
+            return 1, ["Hugging Face Token не найден"]
+
+        try:
+            path = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                token=hf_token,
+                local_dir=str(target_dir),
+            )
+
+            return 0, [f"СКАЧАНО: {path}"]
+
+        except Exception as e:
+            return 1, [f"{type(e).__name__}: {e}"]
+
+    # CivitAI
+    if "civitai.com/api/download/models/" in url:
+        token = load_civitai_token()
+
+        if not token:
+            return 1, ["CivitAI Token не найден"]
+
+        try:
+            response = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                stream=True,
+                timeout=60,
+                allow_redirects=True,
+            )
+
+            response.raise_for_status()
+
+            filename = None
+            content_disposition = response.headers.get("Content-Disposition", "")
+
+            if "filename=" in content_disposition:
+                filename = content_disposition.split("filename=", 1)[1].strip().strip('"')
+
+            if not filename:
+                filename = url.rstrip("/").split("/")[-1] or "model.safetensors"
+
+            output_path = target_dir / filename
+
+            total = int(response.headers.get("Content-Length", 0))
+            downloaded = 0
+            last_percent = -1
+
+            with open(output_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+
+                        if total and progress_callback:
+                            percent = int(downloaded * 100 / total)
+
+                            if percent != last_percent:
+                                last_percent = percent
+                                await progress_callback(downloaded, total)
+
+            return 0, [
+                f"СКАЧАНО: {output_path}",
+                f"Размер: {downloaded / 1024 / 1024:.1f} MB",
+            ]
+
+        except Exception as e:
+            return 1, [f"{type(e).__name__}: {e}"]
+
+    # Остальные источники пока скачиваем через aria2c
+    command = [
+        "aria2c",
+        "-x", "16",
+        "-s", "16",
+        "--file-allocation=none",
+        "--summary-interval=1",
+        "--console-log-level=notice",
+        "-d", str(target_dir),
+        url,
+    ]
+
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+
+    output = []
+
+    while True:
+        line = await process.stdout.readline()
+        if not line:
+            break
+
+        decoded = line.decode(errors="ignore").strip()
+
+        if decoded:
+            output.append(decoded)
+
+    return_code = await process.wait()
+
+    return return_code, output
+
+async def manager_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "MODEL MANAGER\n\n"
+        "Функция пока в разработке."
+    )
+
+
+async def download_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("download_menu") == "civitai_token":
+        token = update.message.text.strip()
+
+        if not token:
+            await update.message.reply_text("Токен не может быть пустым.")
+            return
+
+        save_civitai_token(token)
+        context.user_data["civitai_token"] = token
+        context.user_data["download_menu"] = "type"
+
+        await update.message.reply_text(
+            "CivitAI Token сохранён локально.\\n\\n"
+            "1. Checkpoints\\n"
+            "2. LoRAs\\n"
+            "3. Text Encoders\\n"
+            "4. VAE\\n"
+            "5. Diffusion Models\\n"
+            "6. Upscalers\\n"
+            "7. CLIP\\n"
+            "8. Other\\n"
+            "0. Назад"
+        )
+        return
+
+    if context.user_data.get("download_menu") == "hf_token":
+        token = update.message.text.strip()
+
+        if not token:
+            await update.message.reply_text("Токен не может быть пустым.")
+            return
+
+        save_hf_token(token)
+        context.user_data["hf_token"] = token
+        context.user_data["download_menu"] = "type"
+
+        await update.message.reply_text(
+            "Hugging Face Token сохранён локально.\n\n"
+            "1. Checkpoints\n"
+            "2. LoRAs\n"
+            "3. Text Encoders\n"
+            "4. VAE\n"
+            "5. Diffusion Models\n"
+            "6. Upscalers\n"
+            "7. CLIP\n"
+            "8. Other\n"
+            "0. Назад"
+        )
+        return
+
+    if context.user_data.get("download_menu") == "type":
+        await download_type_choice(update, context)
+        return
+
+    if context.user_data.get("download_menu") == "url":
+        await download_url_choice(update, context)
+        return
+
+    if context.user_data.get("download_menu") != "source":
+        return
+
+    choice = update.message.text.strip()
+
+    if choice == "1":
+        context.user_data["download_source"] = "huggingface"
+
+        if context.user_data.get("hf_token") or load_hf_token():
+            context.user_data["download_menu"] = "type"
+            await update.message.reply_text(
+                "Hugging Face Token уже сохранён.\n\n"
+                "1. Checkpoints\n"
+                "2. LoRAs\n"
+                "3. Text Encoders\n"
+                "4. VAE\n"
+                "5. Diffusion Models\n"
+                "6. Upscalers\n"
+                "7. CLIP\n"
+                "8. Other\n"
+                "0. Назад"
+            )
+        else:
+            context.user_data["download_menu"] = "hf_token"
+            await update.message.reply_text(
+                "Hugging Face Token не найден.\n\n"
+                "Отправь HF Token."
+            )
+
+    elif choice == "2":
+        context.user_data["download_source"] = "civitai"
+
+        if context.user_data.get("civitai_token") or load_civitai_token():
+            context.user_data["download_menu"] = "type"
+            await update.message.reply_text(
+                "CivitAI Token уже сохранён.\n\n"
+                "1. Checkpoints\n"
+                "2. LoRAs\n"
+                "3. Text Encoders\n"
+                "4. VAE\n"
+                "5. Diffusion Models\n"
+                "6. Upscalers\n"
+                "7. CLIP\n"
+                "8. Other\n"
+                "0. Назад"
+            )
+        else:
+            context.user_data["download_menu"] = "civitai_token"
+            await update.message.reply_text(
+                "CivitAI выбран.\n\n"
+                "Отправь CivitAI API Token."
+            )
+
+    elif choice == "0":
+        context.user_data.pop("download_menu", None)
+        await update.message.reply_text("Загрузка отменена.")
+
+    else:
+        await update.message.reply_text("Выбери 1, 2 или 0.")
+
+
+app.add_handler(CommandHandler("download", download_command))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_choice))
+app.add_handler(CommandHandler("manager", manager_command))
 app.add_handler(MessageHandler(filters.PHOTO, photo_message))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_type_choice))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message))
 
-print("Bot started")
-app.run_polling()
+if __name__ == "__main__":
+    print("Bot started")
+    app.run_polling()
