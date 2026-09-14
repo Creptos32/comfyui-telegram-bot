@@ -996,14 +996,221 @@ async def download_file(url, folder, progress_callback=None):
 
     return return_code, output
 
+MODEL_MANAGER_TYPES = {
+    "Checkpoints": "models/checkpoints",
+    "LoRAs": "models/loras",
+    "Text Encoders": "models/text_encoders",
+    "VAE": "models/vae",
+    "Diffusion Models": "models/diffusion_models",
+    "Upscalers": "models/upscale_models",
+    "CLIP": "models/clip",
+    "Other": "models",
+}
+
+
+def get_installed_models():
+    models = []
+    number = 1
+
+    for category, relative_folder in MODEL_MANAGER_TYPES.items():
+        folder = Path("/workspace/ComfyUI") / relative_folder
+
+        if not folder.exists():
+            continue
+
+        for file_path in sorted(folder.iterdir()):
+            if not file_path.is_file():
+                continue
+
+            # Не показываем служебные placeholder-файлы ComfyUI
+            if file_path.name.startswith("put_") or file_path.name == ".gitkeep":
+                continue
+
+            # Для Other не показываем файлы из подпапок других категорий
+            if category == "Other":
+                if any(
+                    str(file_path).startswith(
+                        str(Path("/workspace/ComfyUI") / subfolder) + "/"
+                    )
+                    for subfolder in MODEL_MANAGER_TYPES.values()
+                    if subfolder != "models"
+                ):
+                    continue
+
+            size_gb = file_path.stat().st_size / 1024 / 1024 / 1024
+
+            models.append({
+                "number": number,
+                "category": category,
+                "name": file_path.name,
+                "path": str(file_path),
+                "size_gb": size_gb,
+            })
+
+            number += 1
+
+    return models
+
+
 async def manager_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "MODEL MANAGER\n\n"
-        "Функция пока в разработке."
+    models = get_installed_models()
+
+    if not models:
+        await update.message.reply_text(
+            "MODEL MANAGER\n\n"
+            "Модели не найдены."
+        )
+        return
+
+    context.user_data["manager_models"] = models
+    context.user_data["manager_menu"] = "select"
+
+    lines = ["MODEL MANAGER\n"]
+
+    current_category = None
+
+    for model in models:
+        if model["category"] != current_category:
+            current_category = model["category"]
+            lines.append(f"\n[{current_category}]")
+
+        lines.append(
+            f"{model['number']}. {model['name']} "
+            f"({model['size_gb']:.2f} GB)"
+        )
+
+    lines.append(
+        "\nВведи номер модели для удаления."
     )
+    lines.append("0. Отмена")
+
+    await update.message.reply_text("\n".join(lines))
 
 
 async def download_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    # MODEL MANAGER: выбор модели
+    if context.user_data.get("manager_menu") == "select":
+        text = update.message.text.strip()
+
+        if text == "0":
+            context.user_data.pop("manager_menu", None)
+            context.user_data.pop("manager_models", None)
+
+            await update.message.reply_text("Удаление отменено.")
+            return
+
+        try:
+            number = int(text)
+        except ValueError:
+            await update.message.reply_text(
+                "Введи номер модели из списка или 0 для отмены."
+            )
+            return
+
+        models = context.user_data.get("manager_models", [])
+
+        selected = next(
+            (model for model in models if model["number"] == number),
+            None,
+        )
+
+        if not selected:
+            await update.message.reply_text(
+                "Модели с таким номером нет. Введи номер из списка или 0."
+            )
+            return
+
+        context.user_data["manager_selected"] = selected
+        context.user_data["manager_menu"] = "confirm"
+
+        await update.message.reply_text(
+            "Выбрана модель:\n\n"
+            f"{selected['name']}\n"
+            f"Категория: {selected['category']}\n"
+            f"Размер: {selected['size_gb']:.2f} GB\n\n"
+            "Удалить модель?\n\n"
+            "1. Да, удалить\n"
+            "2. Нет, отмена"
+        )
+        return
+
+    # MODEL MANAGER: подтверждение удаления
+    if context.user_data.get("manager_menu") == "confirm":
+        choice = update.message.text.strip()
+
+        if choice == "2":
+            context.user_data.pop("manager_menu", None)
+            context.user_data.pop("manager_models", None)
+            context.user_data.pop("manager_selected", None)
+
+            await update.message.reply_text("Удаление отменено.")
+            return
+
+        if choice != "1":
+            await update.message.reply_text(
+                "Выбери 1 для удаления или 2 для отмены."
+            )
+            return
+
+        selected = context.user_data.get("manager_selected")
+
+        if not selected:
+            context.user_data.pop("manager_menu", None)
+            await update.message.reply_text(
+                "Выбранная модель больше недоступна."
+            )
+            return
+
+        model_path = Path(selected["path"]).resolve()
+        models_root = Path("/workspace/ComfyUI/models").resolve()
+
+        # Дополнительная защита: удаляем только внутри models
+        try:
+            model_path.relative_to(models_root)
+        except ValueError:
+            context.user_data.pop("manager_menu", None)
+            context.user_data.pop("manager_models", None)
+            context.user_data.pop("manager_selected", None)
+
+            await update.message.reply_text(
+                "Ошибка безопасности: файл находится вне папки моделей."
+            )
+            return
+
+        if not model_path.is_file():
+            context.user_data.pop("manager_menu", None)
+            context.user_data.pop("manager_models", None)
+            context.user_data.pop("manager_selected", None)
+
+            await update.message.reply_text(
+                "Файл уже не существует."
+            )
+            return
+
+        size_bytes = model_path.stat().st_size
+        size_gb = size_bytes / 1024 / 1024 / 1024
+
+        try:
+            model_path.unlink()
+        except Exception as e:
+            await update.message.reply_text(
+                "Ошибка удаления:\n\n"
+                f"{type(e).__name__}: {e}"
+            )
+            return
+
+        context.user_data.pop("manager_menu", None)
+        context.user_data.pop("manager_models", None)
+        context.user_data.pop("manager_selected", None)
+
+        await update.message.reply_text(
+            "Модель удалена.\n\n"
+            f"{selected['name']}\n"
+            f"Освобождено: {size_gb:.2f} GB"
+        )
+        return
+
     if context.user_data.get("download_menu") == "civitai_token":
         token = update.message.text.strip()
 
